@@ -1,0 +1,37 @@
+kind: ReplicationController 
+metadata: 
+  name: zabbix-web
+  namespace: default 
+  labels: 
+    name: zabbix-web
+    version: v1 
+spec: 
+  replicas: 1 
+  selector: 
+    name: zabbix-web
+    version: v1 
+  template: 
+    metadata: 
+      labels: 
+        name: zabbix-web
+        version: v1 
+    spec: 
+      containers: 
+        - image: 私有仓库地址:5000/zabbix-web-apache-mysql
+          name: zabbix-web
+          ports: 
+            - containerPort: 80 
+             
+          env: 
+            - name: DB_SERVER_HOST 
+              value: "clusterIP"
+            - name: ZBX_SERVER_HOST
+              value: "10.254.61.189" 
+            - name: MYSQL_USER
+              value: "zabbix"
+            - name: MYSQL_PASSWORD
+              value: "zabbix"
+            - name: MYSQL_DATABASE
+              value: "zabbix"
+            - name: TZ
+              value: "Asia/Shanghai"
