@@ -1,0 +1,1 @@
+ทรฮส NondeIP:NodePort/jenkins
