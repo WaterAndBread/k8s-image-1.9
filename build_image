@@ -1,0 +1,332 @@
+#!/bin/bash
+
+deploy_type=${1:?}
+file_name=${2:?}
+app_name=${3:?}
+port=${4:?}
+registry_project=${5:?}
+jdk_version=${6:?}
+replicas=${7:?}
+env_name=${8:?}
+job_prefix=${9:?}
+dubbo_port=${10:?}
+root_location=${11:?}
+
+file_tmp_dir="/tmp"
+source_file="${file_tmp_dir}/${file_name}"
+now_date=$(date "+%Y%m%d_%H%M%S")
+registry_url='registry.ebanma.com'
+kube_config="/root/.kube/${job_prefix}.config"
+need_delete_log4j_jar="WEB-INF/lib/slf4j-log4j12-1.7.7.jar"
+
+build_image_base_dir="/var/jenkins/build_images/${registry_project}_${env_name}/${app_name}"
+
+[ -d "${build_image_base_dir}" ] && /bin/rm -rf ${build_image_base_dir} 
+mkdir -p ${build_image_base_dir}
+
+#time flag for logs
+function log_time(){
+	echo -n $(date "+%Y-%m-%d %H:%M:%S")
+}
+
+#get file md5 and check the md5 is same one.
+md5=$(md5sum ${source_file} | awk '{print $1}')
+ls ${source_file} | grep -q ${md5}
+if [ $? -ne 0 ];then
+	echo "`log_time` [ERROR] file md5 ${md5} not matched in file name ${file_name}."
+	exit 1
+fi
+
+#define the app's image name, combined with registry_name, app_name, env_name, date and md5
+new_image="${registry_url}/${registry_project}/${app_name}:${env_name}-${now_date}-${md5}"
+
+#run docker build command and push it to registry if build success
+function exec_building_image(){
+	echo "`log_time` [INFO] building image ${new_image} ..."
+	docker build -t ${new_image} .
+	if [ $? -eq 0 ];then
+		echo "`log_time` [INFO] image build ${new_image} success"
+		echo "`log_time` [INFO] pushing image ${new_image} ..."
+		docker push ${new_image}
+		if [ $? -eq 0 ];then
+			echo "`log_time` [INFO] image push ${new_image} done"
+		else
+			echo "`log_time` [INFO] image push ${new_image} failed"
+			exit 1
+		fi
+	else
+		echo "`log_time` [ERROR] image build ${new_image} failed"
+		exit 1
+	fi
+}
+
+#docker file for tomcat
+function build_tomcat(){
+	cd ${build_image_base_dir}
+	#log4j_jar_file="${build_image_base_dir}/${app_name}/${need_delete_log4j_jar}"
+	#[ -f "${log4j_jar_file}" ] && /bin/rm -f ${log4j_jar_file}
+	cat > Dockerfile << EOF_DOCKERFILE
+FROM ${base_image}
+COPY ${app_name}.war /app/tomcat/webapps/${app_name}.war
+EOF_DOCKERFILE
+	exec_building_image
+}
+
+#generate entrypoint script for jar service 
+function gen_jar_service_entrypoint(){
+app_base_dir="/app/${app_name}"
+log_file="${app_base_dir}/${app_name}.log"
+	cat > entrypoint.sh << EOF_ENTRYPOINT
+#!/bin/bash
+
+source ~/.bashrc
+
+/bin/ln -s ${app_base_dir}/${app_name}.jar /etc/init.d/${app_name}
+chmod +x ${app_base_dir}/${app_name}.jar
+[ -f "${log_file}" ] || touch ${log_file}
+/etc/init.d/${app_name} start
+
+tail -f ${log_file}
+EOF_ENTRYPOINT
+chmod +x entrypoint.sh
+}
+
+#generate healthcheck script for jar service 
+function gen_jar_healthcheck(){
+cat > healthcheck.sh << EOF_HEALTHCHECK
+#!/bin/bash
+
+curl --connect-timeout 3 -m 3 http://127.0.0.1:${port}/ > /dev/null 2> /dev/null
+if [ \$? -eq 0 ];then
+	exit 0
+else
+	exit 1
+fi
+EOF_HEALTHCHECK
+chmod +x healthcheck.sh
+}
+
+#docker file for jar service
+function build_jar(){
+	cd ${build_image_base_dir}
+	gen_jar_service_entrypoint
+	gen_jar_healthcheck
+	cat > Dockerfile << EOF_DOCKERFILE
+FROM ${base_image}
+EXPOSE ${port}
+COPY healthcheck.sh /healthcheck.sh
+COPY entrypoint.sh /entrypoint.sh
+COPY ${app_name} /app/${app_name}
+ENTRYPOINT ["/bin/bash", "/entrypoint.sh"]
+EOF_DOCKERFILE
+	exec_building_image
+}
+
+#k8s yaml file for tomcat service
+function gen_k8s_service_tomcat(){
+	cat > ${app_name}.yaml << EOF_SERVICE_YAML
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${app_name}
+  labels:
+    project: ${registry_project}
+    app: ${app_name}
+spec:
+  sessionAffinity: ClientIP
+  selector:
+    project: ${registry_project}
+    app: ${app_name}
+  ports:
+  - name: http
+    port: ${port}
+EOF_SERVICE_YAML
+}
+
+#k8s yaml file for jar service
+function gen_k8s_service_jar(){
+	cat > ${app_name}.yaml << EOF_SERVICE_YAML
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${app_name}
+  labels:
+    project: ${registry_project}
+    app: ${app_name}
+spec:
+  type: NodePort
+  sessionAffinity: ClientIP
+  selector:
+    project: ${registry_project}
+    app: ${app_name}
+  ports:
+  - name: http
+    port: ${port}
+    nodePort: ${port}
+EOF_SERVICE_YAML
+}
+
+function generate_dubbo_port_service(){
+if [ "$dubbo_port" -ne 0 ];then
+	cat >> ${app_name}.yaml << EOF_SERVICE_YAML
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${app_name}-dubbo
+  labels:
+    project: ${registry_project}
+    app: ${app_name}
+spec:
+  type: NodePort
+  sessionAffinity: ClientIP
+  selector:
+    project: ${registry_project}
+    app: ${app_name}
+  ports:
+  - name: dubbo
+    port: ${dubbo_port}
+    nodePort: ${dubbo_port}
+EOF_SERVICE_YAML
+fi
+}
+
+#base deployment yaml 
+function gen_k8s_yaml(){
+cat >> ${app_name}.yaml <<EOF_YAML
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: ${app_name}
+spec:
+  rules:
+  - host: ${app_name}
+    http:
+      paths:
+      - path: /${url_prefix}
+        backend:
+          serviceName: ${app_name}
+          servicePort: ${port}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${app_name}
+  labels:
+    project: ${registry_project}
+    app: ${app_name}
+spec:
+  replicas: ${replicas}
+  selector:
+    matchLabels:
+      project: ${registry_project}
+      app: ${app_name}
+  template:
+    metadata:
+      name: ${app_name}
+      labels:
+        project: ${registry_project}
+        app: ${app_name}
+    spec:
+      containers:
+      - name: ${app_name}
+        image: ${new_image}
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: ${port}
+        livenessProbe:
+          exec:
+            command:
+            - "/bin/bash"
+            - "/healthcheck.sh"
+          initialDelaySeconds: 20
+          timeoutSeconds: 3
+          periodSeconds: 5
+          failureThreshold: 100
+        readinessProbe:
+          exec:
+            command:
+            - "/bin/bash"
+            - "/healthcheck.sh"
+          initialDelaySeconds: 20
+          timeoutSeconds: 3
+          periodSeconds: 5
+          failureThreshold: 100
+        volumeMounts:
+        - name: logs
+          mountPath: ${log_dir}
+        - name: xconfig
+          mountPath: /root/.xconfig/
+        - name: cat
+          mountPath: /data/appdatas/cat/
+      volumes:
+      - name: logs
+        emptyDir: {}
+      - name: cat
+        configMap:
+          name: cat
+          defaultMode: 0644
+      - name: xconfig
+        configMap:
+          name: xconfig
+          defaultMode: 0644
+EOF_YAML
+echo "`log_time` [INFO] delete old k8s app if exist."
+export KUBECONFIG=${kube_config}
+kubectl delete -f ${app_name}.yaml > /dev/null 2> /dev/null
+echo "`log_time` [INFO] deploy k8s app ${app_name}"
+kubectl create -f ${app_name}.yaml
+if [ $? -eq 0 ];then
+	echo "`log_time` [INFO] deploy command exec successful"
+else
+	echo "`log_time` [ERROR] deploy command exec failed"
+	exit 1
+fi
+}
+
+#check decompress is success
+function check_decompress(){
+	if [ ${1:?} -eq 0 ];then
+		rm -f ${source_file}
+	else
+		echo "`log_time` [ERROR] decompress file failed, file type was $(type ${source_file})"
+		rm -f ${source_file}
+		exit 1
+	fi
+}
+
+if [ "${deploy_type}" == 'war' ];then
+	log_dir="/app/tomcat/logs"
+	base_image="${registry_url}/base/tomcat7:jdk${jdk_version}"
+	#base_image="${registry_url}/base/tomcat:8.0.50_jdk${jdk_version}"
+	war_name="${app_name}.war"
+	url_prefix=${app_name}
+	#/bin/mkdir -p ${build_image_base_dir}/${app_name}
+	#unzip -q ${source_file} -d ${build_image_base_dir}/${app_name}
+	cp ${source_file} ${build_image_base_dir}/${app_name}.war
+	#check_decompress $?
+	build_tomcat
+	gen_k8s_service_tomcat
+	generate_dubbo_port_service
+	gen_k8s_yaml
+elif [ "${deploy_type}" == 'jar' ];then
+	log_dir="/alidata1/app_log/${app_name}"
+	base_image="${registry_url}/base/java:${jdk_version}"
+	if [ "${root_location}" != 'default_root_location' ];then
+		url_prefix=${root_location}
+	fi
+	tar -xf ${source_file} -C ${build_image_base_dir}
+	check_decompress $?
+	build_jar
+	gen_k8s_service_jar
+	generate_dubbo_port_service
+	gen_k8s_yaml
+elif [ "${deploy_type}" == 'shell' ];then
+	base_image="${registry_url}/base/java:${jdk_version}"
+	tar -xf ${source_file} -C ${build_image_base_dir}
+	check_decompress $?
+else
+	base_image="${registry_url}/base/java:${jdk_version}"
+fi
